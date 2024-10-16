@@ -1,6 +1,7 @@
 /*++
 
 Copyright (c) Microsoft Corporation. All rights reserved.
+SPDX-FileCopyrightText: Copyright 2024 Arm Limited and/or its affiliates <open-source-office@arm.com>
 
 Licensed under the MIT License.
 
@@ -17,6 +18,9 @@ Abstract:
 
 #include "sqnbitgemm.h"
 #include "sqnbitgemm_q8_block.h"
+#include "kai/ukernels/matmul/pack/kai_lhs_quant_pack_qai8dxp_f32.h"
+#include "kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4c32p/kai_matmul_clamp_f32_qai8dxp4x8_qsi4c32p4x8_16x4x32_neon_i8mm.h"
+#include "kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4c32p/kai_matmul_clamp_f32_qai8dxp1x8_qsi4c32p4x8_1x4x32_neon_dotprod.h"
 
 #include <cassert>
 
@@ -437,121 +441,166 @@ SQ4BitGemm_CompInt8(
     const size_t RangeCountN
 )
 {
-#ifdef MLAS_TARGET_AMD64_IX86
     PerGemmQuantAWorkspace* const per_gemm_quant_a_workspace = static_cast<PerGemmQuantAWorkspace*>(PerGemmWorkspace);
-    constexpr size_t BlkBitWidth = 4;
+    const size_t dst_stride = DataParams->ldc * sizeof(float);
 
-    const size_t k_blks = MlasDivRoundup(K, BlkLen);
-
-    // quant A scale is embedded in QuantData if QuantScale is nullptr.
-    const size_t lda = k_blks * (per_gemm_quant_a_workspace->QuantScale ? BlkLen : Q8BlkSize(BlkLen));
-    const size_t ldc = DataParams->ldc;
-    const size_t ldb = k_blks * MlasQNBitBlkDataSizeInBytes(BlkBitWidth, BlkLen);
-    const size_t k_blks_zp_bytes = MlasQNBitZeroPointsForBlksSizeInBytes<BlkBitWidth>(k_blks);
-
-    const std::byte* QuantA = per_gemm_quant_a_workspace->QuantData + RangeStartM * lda;
-    const float* QuantAScale = per_gemm_quant_a_workspace->QuantScale + RangeStartM * k_blks;
-
-    assert(RangeStartN % 4 == 0);
-    const std::byte* QuantBData = static_cast<const std::byte*>(DataParams->PackedQuantBData) + RangeStartN * ldb;
-    const float* QuantBScale = DataParams->QuantBScale + RangeStartN * k_blks;
-    const std::byte* QuantBZeroPoint =
-        (DataParams->QuantBZeroPoint == nullptr)
-            ? nullptr
-            : static_cast<const std::byte*>(DataParams->QuantBZeroPoint) + RangeStartN * k_blks_zp_bytes;
-    const float* ABlockSum = per_gemm_quant_a_workspace->BlockSum + RangeStartM * k_blks;
-    const float* QuantBBlkSum = DataParams->QuantBBlkSum + RangeStartN * k_blks;
-    float* C = DataParams->C + RangeStartM * ldc + RangeStartN;
-
-    const float* Bias = (DataParams->Bias == nullptr) ? nullptr : DataParams->Bias + RangeStartN;
-#else
-    constexpr size_t BlkBitWidth = 4;
-
-    const size_t k_blks = MlasDivRoundup(K, BlkLen);
-
-    const size_t lda = k_blks * Q8BlkSize(BlkLen);
-    const size_t ldc = DataParams->ldc;
-    const size_t ldb = k_blks * MlasQNBitBlkDataSizeInBytes(BlkBitWidth, BlkLen);
-    const size_t k_blks_zp_bytes = MlasQNBitZeroPointsForBlksSizeInBytes<BlkBitWidth>(k_blks);
-
-    const std::byte* QuantA = static_cast<const std::byte*>(PerGemmWorkspace) + RangeStartM * lda;
-
-    const std::byte* QuantBData = static_cast<const std::byte*>(DataParams->PackedQuantBData) + RangeStartN * ldb;
-    const float* QuantBScale = DataParams->QuantBScale + RangeStartN * k_blks;
-    const std::byte* QuantBZeroPoint =
-        (DataParams->QuantBZeroPoint == nullptr)
-            ? nullptr
-            : static_cast<const std::byte*>(DataParams->QuantBZeroPoint) + RangeStartN * k_blks_zp_bytes;
-
-    float* C = DataParams->C + RangeStartM * ldc + RangeStartN;
-
-    const float* Bias = (DataParams->Bias == nullptr) ? nullptr : DataParams->Bias + RangeStartN;
-#endif
-
-    size_t CountN;
-    for (size_t n = 0; n < RangeCountN; n += CountN) {
-        CountN = std::min(RangeCountN - n, size_t{128});
-
-        const std::byte* a_row = QuantA;
-        const std::byte* b_col = QuantBData + n * ldb;
-        const float* b_col_scale = QuantBScale + n * k_blks;
-        const std::byte* b_col_zp =
-            (QuantBZeroPoint == nullptr) ? nullptr : QuantBZeroPoint + n * k_blks_zp_bytes;
-        float* c_blk = C + n;
-        const float* bias = (Bias == nullptr) ? nullptr : Bias + n;
-
-        if (GetMlasPlatform().SQNBitGemmDispatch->SQ4BitGemmKernel_CompInt8 != nullptr) {
-            size_t RowsRemaining = RangeCountM;
-            while (RowsRemaining > 0) {
-                const auto RowsHandled = GetMlasPlatform().SQNBitGemmDispatch->SQ4BitGemmKernel_CompInt8(
-                    BlkLen,
-                    a_row, b_col, b_col_scale, b_col_zp, c_blk, RowsRemaining, CountN, K, k_blks, ldc, bias
-                );
-
-                if (DataParams->PostProcessor != nullptr) {
-                    DataParams->PostProcessor->Process(
-                        DataParams->C, RangeStartM + RangeCountM - RowsRemaining, RangeStartN + n,
-                        RowsHandled, CountN, ldc
-                    );
-                }
-
-                c_blk += RowsHandled * ldc;
-                a_row += RowsHandled * lda;
-
-                RowsRemaining -= RowsHandled;
-            }
-        }
-#ifdef MLAS_TARGET_AMD64_IX86
-        else if (GetMlasPlatform().SQNBitGemmDispatch->SQ4BitGemmKernel_BlkSum_CompInt8 != nullptr)
-        {
-            const float* b_blk_sum = QuantBBlkSum + n * k_blks;
-            GetMlasPlatform().SQNBitGemmDispatch->SQ4BitGemmKernel_BlkSum_CompInt8(
-                BlkLen,
-                QuantA,
-                QuantAScale,
-                b_col,
-                b_col_scale,
-                b_col_zp,
-                c_blk,
-                RangeCountM,
-                CountN,
-                K,
-                k_blks,
-                bias,
-                ldc,
-                ABlockSum,
-                b_blk_sum
-            );
-
-            if (DataParams->PostProcessor != nullptr) {
-                DataParams->PostProcessor->Process(
-                    DataParams->C, RangeStartM, RangeStartN + n,
-                    RangeCountM, CountN, ldc
-                );
-            }
-        }
-#endif
+    size_t lhs_packed_offset;
+    size_t rhs_packed_offset;
+    size_t dst_offset;
+    if (RangeCountM == 1 && RangeStartM == 0) {
+        lhs_packed_offset =
+            kai_get_lhs_packed_offset_matmul_clamp_f32_qai8dxp1x8_qsi4c32p4x8_1x4x32_neon_dotprod(
+                RangeStartM, K);
+        rhs_packed_offset =
+            kai_get_rhs_packed_offset_matmul_clamp_f32_qai8dxp1x8_qsi4c32p4x8_1x4x32_neon_dotprod(
+                RangeStartN, K, BlkLen);
+        dst_offset =
+            kai_get_dst_offset_matmul_clamp_f32_qai8dxp1x8_qsi4c32p4x8_1x4x32_neon_dotprod(
+                RangeStartM, RangeStartN, dst_stride);
+    } else {
+        lhs_packed_offset =
+            kai_get_lhs_packed_offset_matmul_clamp_f32_qai8dxp4x8_qsi4c32p4x8_16x4x32_neon_i8mm(
+                RangeStartM, K);
+        rhs_packed_offset =
+            kai_get_rhs_packed_offset_matmul_clamp_f32_qai8dxp4x8_qsi4c32p4x8_16x4x32_neon_i8mm(
+                RangeStartN, K, BlkLen);
+        dst_offset =
+            kai_get_dst_offset_matmul_clamp_f32_qai8dxp4x8_qsi4c32p4x8_16x4x32_neon_i8mm(
+                RangeStartM, RangeStartN, dst_stride);
     }
+
+    const void* lhs_ptr = reinterpret_cast<const void*>(
+            reinterpret_cast<const char *>(per_gemm_quant_a_workspace->QuantData) + lhs_packed_offset);
+    const void* rhs_ptr = reinterpret_cast<const void*>(
+            reinterpret_cast<const char *>(DataParams->PackedQuantBData) + rhs_packed_offset);
+    float* dst_ptr = reinterpret_cast<float*>(
+            reinterpret_cast<uint8_t*>(DataParams->C) + dst_offset);
+
+    if (RangeCountM == 1 && RangeStartM == 0) {
+        kai_run_matmul_clamp_f32_qai8dxp1x8_qsi4c32p4x8_1x4x32_neon_dotprod(
+            RangeCountM, RangeCountN, K, BlkLen, lhs_ptr, rhs_ptr, dst_ptr, dst_stride, sizeof(float),
+            -std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
+    } else {
+        kai_run_matmul_clamp_f32_qai8dxp4x8_qsi4c32p4x8_16x4x32_neon_i8mm(
+            RangeCountM, RangeCountN, K, BlkLen, lhs_ptr, rhs_ptr, dst_ptr, dst_stride, sizeof(float),
+            -std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
+    }
+
+// #ifdef MLAS_TARGET_AMD64_IX86
+//     PerGemmQuantAWorkspace* const per_gemm_quant_a_workspace = static_cast<PerGemmQuantAWorkspace*>(PerGemmWorkspace);
+//     constexpr size_t BlkBitWidth = 4;
+
+//     const size_t k_blks = MlasDivRoundup(K, BlkLen);
+
+//     // quant A scale is embedded in QuantData if QuantScale is nullptr.
+//     const size_t lda = k_blks * (per_gemm_quant_a_workspace->QuantScale ? BlkLen : Q8BlkSize(BlkLen));
+//     const size_t ldc = DataParams->ldc;
+//     const size_t ldb = k_blks * MlasQNBitBlkDataSizeInBytes(BlkBitWidth, BlkLen);
+//     const size_t k_blks_zp_bytes = MlasQNBitZeroPointsForBlksSizeInBytes<BlkBitWidth>(k_blks);
+
+//     const std::byte* QuantA = per_gemm_quant_a_workspace->QuantData + RangeStartM * lda;
+//     const float* QuantAScale = per_gemm_quant_a_workspace->QuantScale + RangeStartM * k_blks;
+
+//     assert(RangeStartN % 4 == 0);
+//     const std::byte* QuantBData = static_cast<const std::byte*>(DataParams->PackedQuantBData) + RangeStartN * ldb;
+//     const float* QuantBScale = DataParams->QuantBScale + RangeStartN * k_blks;
+//     const std::byte* QuantBZeroPoint =
+//         (DataParams->QuantBZeroPoint == nullptr)
+//             ? nullptr
+//             : static_cast<const std::byte*>(DataParams->QuantBZeroPoint) + RangeStartN * k_blks_zp_bytes;
+//     const float* ABlockSum = per_gemm_quant_a_workspace->BlockSum + RangeStartM * k_blks;
+//     const float* QuantBBlkSum = DataParams->QuantBBlkSum + RangeStartN * k_blks;
+//     float* C = DataParams->C + RangeStartM * ldc + RangeStartN;
+
+//     const float* Bias = (DataParams->Bias == nullptr) ? nullptr : DataParams->Bias + RangeStartN;
+// #else
+//     constexpr size_t BlkBitWidth = 4;
+
+//     const size_t k_blks = MlasDivRoundup(K, BlkLen);
+
+//     const size_t lda = k_blks * Q8BlkSize(BlkLen);
+//     const size_t ldc = DataParams->ldc;
+//     const size_t ldb = k_blks * MlasQNBitBlkDataSizeInBytes(BlkBitWidth, BlkLen);
+//     const size_t k_blks_zp_bytes = MlasQNBitZeroPointsForBlksSizeInBytes<BlkBitWidth>(k_blks);
+
+//     const std::byte* QuantA = static_cast<const std::byte*>(PerGemmWorkspace) + RangeStartM * lda;
+
+//     const std::byte* QuantBData = static_cast<const std::byte*>(DataParams->PackedQuantBData) + RangeStartN * ldb;
+//     const float* QuantBScale = DataParams->QuantBScale + RangeStartN * k_blks;
+//     const std::byte* QuantBZeroPoint =
+//         (DataParams->QuantBZeroPoint == nullptr)
+//             ? nullptr
+//             : static_cast<const std::byte*>(DataParams->QuantBZeroPoint) + RangeStartN * k_blks_zp_bytes;
+
+//     float* C = DataParams->C + RangeStartM * ldc + RangeStartN;
+
+//     const float* Bias = (DataParams->Bias == nullptr) ? nullptr : DataParams->Bias + RangeStartN;
+// #endif
+
+//     size_t CountN;
+//     for (size_t n = 0; n < RangeCountN; n += CountN) {
+//         CountN = std::min(RangeCountN - n, size_t{128});
+
+//         const std::byte* a_row = QuantA;
+//         const std::byte* b_col = QuantBData + n * ldb;
+//         const float* b_col_scale = QuantBScale + n * k_blks;
+//         const std::byte* b_col_zp =
+//             (QuantBZeroPoint == nullptr) ? nullptr : QuantBZeroPoint + n * k_blks_zp_bytes;
+//         float* c_blk = C + n;
+//         const float* bias = (Bias == nullptr) ? nullptr : Bias + n;
+
+//         if (GetMlasPlatform().SQNBitGemmDispatch->SQ4BitGemmKernel_CompInt8 != nullptr) {
+//             size_t RowsRemaining = RangeCountM;
+//             while (RowsRemaining > 0) {
+//                 const auto RowsHandled = GetMlasPlatform().SQNBitGemmDispatch->SQ4BitGemmKernel_CompInt8(
+//                     BlkLen,
+//                     a_row, b_col, b_col_scale, b_col_zp, c_blk, RowsRemaining, CountN, K, k_blks, ldc, bias
+//                 );
+
+//                 if (DataParams->PostProcessor != nullptr) {
+//                     DataParams->PostProcessor->Process(
+//                         DataParams->C, RangeStartM + RangeCountM - RowsRemaining, RangeStartN + n,
+//                         RowsHandled, CountN, ldc
+//                     );
+//                 }
+
+//                 c_blk += RowsHandled * ldc;
+//                 a_row += RowsHandled * lda;
+
+//                 RowsRemaining -= RowsHandled;
+//             }
+//         }
+// #ifdef MLAS_TARGET_AMD64_IX86
+//         else if (GetMlasPlatform().SQNBitGemmDispatch->SQ4BitGemmKernel_BlkSum_CompInt8 != nullptr)
+//         {
+//             const float* b_blk_sum = QuantBBlkSum + n * k_blks;
+//             GetMlasPlatform().SQNBitGemmDispatch->SQ4BitGemmKernel_BlkSum_CompInt8(
+//                 BlkLen,
+//                 QuantA,
+//                 QuantAScale,
+//                 b_col,
+//                 b_col_scale,
+//                 b_col_zp,
+//                 c_blk,
+//                 RangeCountM,
+//                 CountN,
+//                 K,
+//                 k_blks,
+//                 bias,
+//                 ldc,
+//                 ABlockSum,
+//                 b_blk_sum
+//             );
+
+//             if (DataParams->PostProcessor != nullptr) {
+//                 DataParams->PostProcessor->Process(
+//                     DataParams->C, RangeStartM, RangeStartN + n,
+//                     RangeCountM, CountN, ldc
+//                 );
+//             }
+//         }
+// #endif
+//     }
 }
 
 typedef void(InitializeWorkspaceFn)(
@@ -585,7 +634,7 @@ InitializeWorkspace_CompInt8(
     const auto QuantizeARow2 = GetMlasPlatform().SQNBitGemmDispatch->QuantizeARowComputeBlkSum_CompInt8;
 
     const size_t BlockCountK = MlasDivRoundup(K, BlkLen);
-    const size_t QuantAStride = BlockCountK * Q8BlkSize(BlkLen);
+    // const size_t QuantAStride = BlockCountK * Q8BlkSize(BlkLen);
 
     // TODO: try parallel on BatchN * M threads because BatchN is usually 1.
     if (QuantizeARow) {
@@ -594,12 +643,37 @@ InitializeWorkspace_CompInt8(
 
             const float* ARowPtr = data.A;
             std::byte* QuantARowPtr = static_cast<std::byte*>(Workspace) + gemm_idx * PerGemmWorkspaceStride;
-            for (size_t m = 0; m < M; ++m) {
-                QuantizeARow(BlkLen, ARowPtr, K, QuantARowPtr);
+            // for (size_t m = 0; m < M; ++m) {
+            //     QuantizeARow(BlkLen, ARowPtr, K, QuantARowPtr);
 
-                ARowPtr += data.lda;
-                QuantARowPtr += QuantAStride;
+            //     ARowPtr += data.lda;
+            //     QuantARowPtr += QuantAStride;
+            // }
+
+            size_t mr;
+            size_t kr;
+            size_t sr;
+            if (M == 1) {
+                mr = kai_get_mr_matmul_clamp_f32_qai8dxp1x8_qsi4c32p4x8_1x4x32_neon_dotprod();
+                kr = kai_get_kr_matmul_clamp_f32_qai8dxp1x8_qsi4c32p4x8_1x4x32_neon_dotprod();
+                sr = kai_get_sr_matmul_clamp_f32_qai8dxp1x8_qsi4c32p4x8_1x4x32_neon_dotprod();
+            } else {
+                mr = kai_get_mr_matmul_clamp_f32_qai8dxp4x8_qsi4c32p4x8_16x4x32_neon_i8mm();
+                kr = kai_get_kr_matmul_clamp_f32_qai8dxp4x8_qsi4c32p4x8_16x4x32_neon_i8mm();
+                sr = kai_get_sr_matmul_clamp_f32_qai8dxp4x8_qsi4c32p4x8_16x4x32_neon_i8mm();
             }
+
+            const size_t src_stride = K * sizeof(float);
+            const size_t lhs_offset = kai_get_lhs_offset_lhs_quant_pack_qai8dxp_f32(0, src_stride);
+            const size_t lhs_packed_offset = kai_get_lhs_packed_offset_lhs_quant_pack_qai8dxp_f32(
+                                    0, K, mr, kr, sr);
+
+            const float* src_ptr = reinterpret_cast<const float*>(
+                                    reinterpret_cast<const uint8_t*>(ARowPtr) + lhs_offset);
+            void*        dst_ptr = reinterpret_cast<void *>(
+                                    reinterpret_cast<uint8_t*>(QuantARowPtr) + lhs_packed_offset);
+
+            kai_run_lhs_quant_pack_qai8dxp_f32(M, K, mr, kr, sr, 0, src_ptr, src_stride, dst_ptr);
         });
     } else {
         MlasTrySimpleParallel(ThreadPool, BatchN, [&](ptrdiff_t gemm_idx) {

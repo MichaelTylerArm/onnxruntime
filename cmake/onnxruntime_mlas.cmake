@@ -1,4 +1,5 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
+# SPDX-FileCopyrightText: Copyright 2024 Arm Limited and/or its affiliates <open-source-office@arm.com>
 # Licensed under the MIT License.
 
 set(MLAS_ROOT ${ONNXRUNTIME_ROOT}/core/mlas)
@@ -365,9 +366,17 @@ else()
           ${MLAS_SRC_DIR}/sqnbitgemm_kernel_neon.cpp
           ${MLAS_SRC_DIR}/sqnbitgemm_kernel_neon_fp32.cpp
           ${MLAS_SRC_DIR}/sqnbitgemm_kernel_neon_int8.cpp
+          "${CMAKE_SOURCE_DIR}/../../kleidiai/kai/ukernels/matmul/pack/kai_rhs_pack_nxk_qsi4c32p_qsu4c32s1s0.c"
+          "${CMAKE_SOURCE_DIR}/../../kleidiai/kai/ukernels/matmul/pack/kai_lhs_quant_pack_qai8dxp_f32.c"
+          "${CMAKE_SOURCE_DIR}/../../kleidiai/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4c32p/kai_matmul_clamp_f32_qai8dxp4x8_qsi4c32p4x8_16x4x32_neon_i8mm.c"
+          "${CMAKE_SOURCE_DIR}/../../kleidiai/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4c32p/kai_matmul_clamp_f32_qai8dxp1x8_qsi4c32p4x8_1x4x32_neon_dotprod.c"
         )
         set_source_files_properties(${MLAS_SRC_DIR}/sqnbitgemm_kernel_neon_int8.cpp
                                     PROPERTIES COMPILE_FLAGS " -march=armv8.2-a+dotprod")
+        set_source_files_properties("${CMAKE_SOURCE_DIR}/../../kleidiai/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4c32p/kai_matmul_clamp_f32_qai8dxp4x8_qsi4c32p4x8_16x4x32_neon_i8mm.c"
+                                    PROPERTIES COMPILE_FLAGS " -march=armv8.2-a+i8mm")
+                                    set_source_files_properties("${CMAKE_SOURCE_DIR}/../../kleidiai/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4c32p/kai_matmul_clamp_f32_qai8dxp1x8_qsi4c32p4x8_1x4x32_neon_dotprod.c"
+                                                                PROPERTIES COMPILE_FLAGS " -march=armv8.2-a+dotprod")
         if (NOT APPLE)
           set(mlas_platform_srcs
             ${mlas_platform_srcs}
@@ -392,6 +401,8 @@ else()
           set_source_files_properties(${MLAS_SRC_DIR}/pooling_fp16.cpp PROPERTIES COMPILE_FLAGS " -march=armv8.2-a+fp16 ")
           set_source_files_properties(${MLAS_SRC_DIR}/sbgemm_kernel_neon.cpp PROPERTIES COMPILE_FLAGS " -march=armv8.2-a+bf16 ")
         endif()
+
+        target_include_directories(onnxruntime_mlas PRIVATE "${CMAKE_SOURCE_DIR}/../../kleidiai")
 
         if(ONNXRUNTIME_MLAS_MULTI_ARCH)
             onnxruntime_add_static_library(onnxruntime_mlas_arm64 ${mlas_platform_srcs})

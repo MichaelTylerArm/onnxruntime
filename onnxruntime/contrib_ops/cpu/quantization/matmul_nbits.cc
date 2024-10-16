@@ -1,4 +1,5 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
+// SPDX-FileCopyrightText: Copyright 2024 Arm Limited and/or its affiliates <open-source-office@arm.com>
 // Licensed under the MIT License.
 
 #include "contrib_ops/cpu/quantization/matmul_nbits_impl.h"
@@ -265,13 +266,18 @@ Status MatMulNBits<T1>::PrePack(const Tensor& tensor, int input_idx, /*out*/ All
     return Status::OK();
   }
   if (input_idx == InputIndex::B) {
+    const Tensor* scales = nullptr;
+    const bool is_const = OpKernel::Info().TryGetConstantInput(InputIndex::scales, &scales);
+    ORT_RETURN_IF_NOT(is_const, "B scales must be constant");
+
     packed_b_size_ = MlasSQNBitGemmPackQuantBDataSize(N_, K_, nbits_, block_size_, compute_type_);
     if (packed_b_size_ == 0) {
       return Status::OK();
     }
     auto qptr = tensor.DataRaw();
+    auto scale_ptr = scales->DataRaw();
     packed_b_ = IAllocator::MakeUniquePtr<void>(alloc, packed_b_size_, true);
-    MlasSQNBitGemmPackQuantBData(N_, K_, nbits_, block_size_, compute_type_, qptr, packed_b_.get(), nullptr, has_zp_input_, nullptr, nullptr);
+    MlasSQNBitGemmPackQuantBData(N_, K_, nbits_, block_size_, compute_type_, qptr, packed_b_.get(), scale_ptr, has_zp_input_, nullptr, nullptr);
     is_packed = true;
   } else if (compute_type_ == CompInt8) {
 #ifdef MLAS_TARGET_AMD64_IX86
@@ -355,11 +361,9 @@ Status MatMulNBits<float>::ComputeBPacked(const Tensor* a,
   for (size_t i = 0; i < batch_count; ++i) {
     data[i].A = a_data + helper.LeftOffsets()[i];
     data[i].lda = lda;
-#ifdef MLAS_TARGET_AMD64_IX86
     if (compute_type_ == CompInt8) {
       data[i].QuantBDataWorkspace = packed_b_.get();
     }
-#endif
     data[i].PackedQuantBData = static_cast<std::byte*>(packed_b_.get());
     data[i].QuantBScale = scales_data;
     data[i].QuantBZeroPoint = zero_points_data;
